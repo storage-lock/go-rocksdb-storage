@@ -3,7 +3,6 @@ package rocksdb_storage
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"sync"
 	"time"
 
@@ -45,12 +44,19 @@ func (x *RocksDBStorage) GetName() string {
 }
 
 // Capabilities 声明 RocksDB 存储支持的能力
-// RocksDB 通过进程内 mutex 实现 CAS，不支持 AtomicDelete
+// RocksDB 是嵌入式单进程存储，DeleteWithVersion 的检查+删除全程持有 x.mu，
+// 在进程内是真正原子的，故可以声明 CapabilityAtomicDelete（与 memory/kv/http 存储一致）。
 func (x *RocksDBStorage) Capabilities() []storage.StorageCapability {
 	return []storage.StorageCapability{
 		storage.CapabilityCAS,
 		storage.CapabilityReliableTime,
+		storage.CapabilityAtomicDelete,
+		storage.CapabilityWatch,
 	}
+}
+
+func (x *RocksDBStorage) Watch(ctx context.Context, lockId string) (<-chan *storage.LockInformation, error) {
+	return storage.NewPollingLockWatcher(x, 500*time.Millisecond).Watch(ctx, lockId)
 }
 
 func (x *RocksDBStorage) Init(ctx context.Context) error {
@@ -59,6 +65,13 @@ func (x *RocksDBStorage) Init(ctx context.Context) error {
 		return err
 	}
 	x.db = db
+
+	if x.options.ReadOptions == nil {
+		x.options.ReadOptions = grocksdb.NewDefaultReadOptions()
+	}
+	if x.options.WriteOptions == nil {
+		x.options.WriteOptions = grocksdb.NewDefaultWriteOptions()
+	}
 
 	if x.options.TimeProvider != nil {
 		x.timeProvider = x.options.TimeProvider
@@ -93,10 +106,7 @@ func (x *RocksDBStorage) CreateWithVersion(ctx context.Context, lockId string, v
 	}
 
 	// 写入新锁记录
-	data, err := json.Marshal(lockInformation)
-	if err != nil {
-		return err
-	}
+	data := []byte(lockInformation.ToJsonString())
 
 	return x.db.Put(x.options.WriteOptions, key, data)
 }
@@ -113,9 +123,11 @@ func (x *RocksDBStorage) UpdateWithVersion(ctx context.Context, lockId string, e
 		return err
 	}
 
-	// 如果锁不存在，返回 ErrLockNotFound
+	// 如果锁不存在，返回 ErrVersionMiss（而不是 ErrLockNotFound）：
+	// 核心层只把 ErrVersionMiss 当可重试（抢占路径），NotFound 是硬错误。
+	// 对齐 memory/etcd/zookeeper/leveldb/memcache 已修口径。
 	if value == nil {
-		return storage_lock.ErrLockNotFound
+		return storage_lock.ErrVersionMiss
 	}
 
 	// 反序列化当前锁信息
@@ -130,10 +142,7 @@ func (x *RocksDBStorage) UpdateWithVersion(ctx context.Context, lockId string, e
 	}
 
 	// 写入更新后的锁记录
-	data, err := json.Marshal(lockInformation)
-	if err != nil {
-		return err
-	}
+	data := []byte(lockInformation.ToJsonString())
 
 	return x.db.Put(x.options.WriteOptions, key, data)
 }
